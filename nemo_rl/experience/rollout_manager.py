@@ -51,6 +51,7 @@ from nemo_rl.experience.rollouts import (
     apply_reward_penalties,
     attach_static_multimodal_payload,
     calculate_rewards,
+    compute_reward_penalty_metrics,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -60,21 +61,6 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
-_REWARD_PENALTY_METRICS = {
-    "duplicated_reasoning": (
-        "penalize_duplicated_reasoning",
-        "reasoning_equal_to_final_answer_rate",
-    ),
-    "empty_final_answer": (
-        "penalize_empty_final_answer",
-        "empty_final_answer_rate",
-    ),
-    "unwanted_token": ("penalize_unwanted_tokens", "unwanted_token_rate"),
-    "malformed_think_tag": (
-        "penalize_malformed_think_tag",
-        "malformed_think_tag_rate",
-    ),
-}
 
 
 class RolloutOutcome(str, enum.Enum):
@@ -1083,14 +1069,11 @@ class AsyncNemoGymRolloutImpl:
         self, penalty_counts: dict[str, int], num_results: int
     ) -> dict[str, float]:
         """Return enabled penalty rates using the legacy Gym metric names."""
-        if not self._reward_penalty_config or not num_results:
-            return {}
-
-        metrics = {}
-        for count_key, (flag, metric_name) in _REWARD_PENALTY_METRICS.items():
-            if self._reward_penalty_config.get(flag):
-                metrics[metric_name] = penalty_counts[count_key] / num_results
-        return metrics
+        return compute_reward_penalty_metrics(
+            penalty_counts,
+            num_results,
+            self._reward_penalty_config,
+        )
 
     def _compute_rollout_metrics(
         self,

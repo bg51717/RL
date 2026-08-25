@@ -44,6 +44,14 @@ class FakeWeightSynchronizer:
     pass
 
 
+def _noncolocated_policy_config(train_global_batch_size: int) -> dict:
+    """Minimal policy block accepted by SingleController validation."""
+    return {
+        "train_global_batch_size": train_global_batch_size,
+        "generation": {"colocated": {"enabled": False}},
+    }
+
+
 def _checkpointing_config(tmp_path) -> dict:
     """Minimal checkpointing block for actors built through __init__."""
     return {
@@ -61,7 +69,7 @@ def _checkpointing_config(tmp_path) -> dict:
 def _grpo_master_config(tmp_path) -> MasterConfig:
     """A minimal GRPO MasterConfig the real __init__ accepts."""
     return MasterConfig.model_construct(
-        policy={"train_global_batch_size": 8},
+        policy=_noncolocated_policy_config(8),
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=2,
             num_generations_per_prompt=4,
@@ -114,7 +122,7 @@ def _init_controller(master_config, actor_args):
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: object())
     master_config = MasterConfig.model_construct(
-        policy={"train_global_batch_size": 4},
+        policy=_noncolocated_policy_config(4),
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=2,
             num_generations_per_prompt=4,
@@ -164,7 +172,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     logger = MagicMock()
     monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
     master_config = MasterConfig.model_construct(
-        policy={"train_global_batch_size": 8},
+        policy=_noncolocated_policy_config(8),
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=2,
             num_generations_per_prompt=4,
@@ -230,7 +238,7 @@ def test_reference_logprobs_required_only_when_kl_enabled(
     """KL-disabled SingleController runs do not request reference logprobs."""
     monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
     master_config = MasterConfig.model_construct(
-        policy={"train_global_batch_size": 8},
+        policy=_noncolocated_policy_config(8),
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=2,
             num_generations_per_prompt=4,
@@ -284,7 +292,7 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
     logger = MagicMock()
     monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
     master_config = MasterConfig.model_construct(
-        policy={"train_global_batch_size": 8},
+        policy=_noncolocated_policy_config(8),
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=2,
             num_generations_per_prompt=4,

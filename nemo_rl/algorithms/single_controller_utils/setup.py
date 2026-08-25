@@ -63,6 +63,7 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     _get_free_port_local,
     _get_node_ip_local,
+    prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
@@ -156,6 +157,7 @@ def _build_clusters(
     backend = generation_config["backend"]
     num_nodes = cluster_config["num_nodes"]
     gpus_per_node = cluster_config["gpus_per_node"]
+    segment_size = cluster_config.get("segment_size")
     port_range_low = cluster_config.get("master_port_range_low")
     port_range_high = cluster_config.get("master_port_range_high")
     # Worker groups sharing the training GPUs: the policy, plus the critic on
@@ -205,6 +207,59 @@ def _build_clusters(
             f"train_nodes must be > 0: {num_nodes} - {inference_nodes} = {train_nodes}"
         )
 
+    train_constraints = None
+    inference_constraints = None
+    inference_segment_size = None
+    if segment_size is not None:
+        train_constraints, remaining_node_ids, topology = prepare_segment_topology(
+            segment_size,
+            train_nodes,
+            role="training",
+        )
+
+        # When topology metadata is unavailable, prepare_segment_topology returns no
+        # constraints and RayVirtualCluster falls back to deterministic rank ordering.
+        if train_constraints is not None:
+            generation_config_dict = cast(dict[str, Any], generation_config)
+            if backend == "vllm":
+                vllm_cfg = generation_config_dict["vllm_cfg"]
+                gpus_per_instance = (
+                    vllm_cfg["tensor_parallel_size"]
+                    * vllm_cfg["pipeline_parallel_size"]
+                )
+            elif backend == "sglang":
+                sglang_server_config = generation_config_dict["sglang_cfg"][
+                    "sglang_server_config"
+                ]
+                gpus_per_instance = sglang_server_config["num_gpus_per_engine"]
+            else:
+                raise ValueError(
+                    "single_controller_utils.setup only supports vllm or sglang "
+                    f"generation; got {backend!r}"
+                )
+
+            nodes_per_instance = (
+                gpus_per_instance + inference_gpus_per_node - 1
+            ) // inference_gpus_per_node
+            if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
+                remaining_topology = {
+                    node_id: topology[node_id] for node_id in remaining_node_ids
+                }
+                inference_constraints, _, _ = prepare_segment_topology(
+                    nodes_per_instance,
+                    inference_nodes,
+                    topology=remaining_topology,
+                    role="inference",
+                )
+                inference_segment_size = nodes_per_instance
+            elif nodes_per_instance > 1:
+                print(
+                    f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
+                    f"nodes_per_instance={nodes_per_instance}; skipping inference "
+                    "topology constraints",
+                    flush=True,
+                )
+
     train_cluster = RayVirtualCluster(
         name="sc_train_cluster",
         bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
@@ -213,6 +268,8 @@ def _build_clusters(
         max_colocated_worker_groups=train_worker_groups,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=segment_size,
+        node_resource_constraints=train_constraints,
     )
     inference_cluster = RayVirtualCluster(
         name="sc_inference_cluster",
@@ -222,6 +279,8 @@ def _build_clusters(
         max_colocated_worker_groups=1,
         port_range_low=port_range_low,
         port_range_high=port_range_high,
+        segment_size=inference_segment_size,
+        node_resource_constraints=inference_constraints,
     )
     return train_cluster, inference_cluster
 
@@ -722,6 +781,11 @@ def setup_single_controller(
     # Create clusters
     train_cluster, inference_cluster = _build_clusters(master_config)
     colocated = generation_config["colocated"]["enabled"]
+
+    # Claim topology-constrained training nodes before inference or NeMo-Gym
+    # tasks can consume them. Inference then receives only the remaining GPUs.
+    if not colocated and master_config.cluster.get("segment_size") is not None:
+        train_cluster.get_placement_groups()
 
     # Create build tasks for generation / trainer / (nemo-gym) workers
     build_tasks: dict[str, Callable[[], Any]] = {}

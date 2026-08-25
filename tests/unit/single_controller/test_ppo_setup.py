@@ -23,7 +23,7 @@ training cluster after the policy has stepped off it.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from omegaconf import OmegaConf
@@ -132,6 +132,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
+        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
         async_rl=AsyncRLConfig(
@@ -744,3 +745,53 @@ class TestTrainClusterSizesForTheCritic:
         else:
             # The critic never lands on the inference cluster.
             assert inference.kwargs["max_colocated_worker_groups"] == 1
+
+    def test_hsg_topology_wires_disjoint_train_and_inference_segments(
+        self, fake_cluster
+    ):
+        mc = _cluster_config(_ppo_master_config(), colocated=False, backend="vllm")
+        mc.cluster.update({"num_nodes": 8, "gpus_per_node": 4, "segment_size": 4})
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 4,
+            "num_nodes": 4,
+        }
+        mc.policy["generation"]["vllm_cfg"] = {
+            "tensor_parallel_size": 8,
+            "pipeline_parallel_size": 1,
+        }
+
+        topology = {
+            **{f"train-{idx}": ("train-domain", idx) for idx in range(4)},
+            **{f"inference-{idx}": ("inference-domain", idx) for idx in range(4)},
+        }
+        remaining_node_ids = [f"inference-{idx}" for idx in range(4)]
+        remaining_topology = {
+            node_id: topology[node_id] for node_id in remaining_node_ids
+        }
+        train_constraints = [{"train-domain": 0.001}] * 4
+        inference_constraints = [{"inference-domain": 0.001}] * 4
+
+        with patch.object(
+            sc_setup_mod,
+            "prepare_segment_topology",
+            side_effect=[
+                (train_constraints, remaining_node_ids, topology),
+                (inference_constraints, [], remaining_topology),
+            ],
+        ) as prepare_topology:
+            train, inference = sc_setup_mod._build_clusters(mc)
+
+        assert prepare_topology.call_args_list == [
+            call(4, 4, role="training"),
+            call(
+                2,
+                4,
+                topology=remaining_topology,
+                role="inference",
+            ),
+        ]
+        assert train.kwargs["segment_size"] == 4
+        assert train.kwargs["node_resource_constraints"] == train_constraints
+        assert train.kwargs["max_colocated_worker_groups"] == 2
+        assert inference.kwargs["segment_size"] == 2
+        assert inference.kwargs["node_resource_constraints"] == inference_constraints

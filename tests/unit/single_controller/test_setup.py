@@ -97,6 +97,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
+        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
         async_rl=AsyncRLConfig(
@@ -228,6 +229,30 @@ class TestSetup:
 
     def test_reward_penalties_are_typed(self):
         assert isinstance(_make_master_config().reward_penalties, RewardPenaltyConfig)
+
+    def test_reserves_topology_constrained_training_before_builds(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.cluster["segment_size"] = 4
+        train_cluster = patched_factories["_build_clusters"].return_value[0]
+        events = []
+        train_cluster.get_placement_groups.side_effect = lambda: events.append(
+            "reserve_training"
+        )
+        original_build = patched_factories["_build_generation"].return_value
+
+        def build_generation(*args, **kwargs):
+            del args, kwargs
+            events.append("build_generation")
+            return original_build
+
+        patched_factories["_build_generation"].side_effect = build_generation
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert events[0] == "reserve_training"
+        train_cluster.get_placement_groups.assert_called_once_with()
 
     def test_reward_penalties_require_gym_before_setup_factories(
         self, patched_factories
